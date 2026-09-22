@@ -1,0 +1,574 @@
+```{r}
+library(rjags)
+library(coda)
+library(caret)
+library(ggplot2)
+library(loo)
+```
+
+
+```{r}
+df <- read.csv("Mental_Health.csv")
+df
+```
+
+```{r}
+colSums(is.na(df))
+```
+```{r}
+unique(df$mental_state)
+```
+```{r}
+df$mental_state_ord <- factor(
+  df$mental_state,
+  levels = c("Healthy", "Stressed", "At_Risk"),
+  ordered = TRUE
+)
+
+df$mental_state_ord <- as.numeric(df$mental_state_ord)
+
+
+num_cols <- sapply(df, is.numeric)
+num_cols["mental_state_ord"] <- FALSE
+
+cor_result <- cor(
+  df[, num_cols],
+  df$mental_state_ord,
+  method = "spearman",
+  use = "complete.obs"
+)
+
+cor_result
+```
+Model Estimation Result for dnorm(0, 0.01)
+```{r}
+
+num_vars <- c(
+  "age",
+  "daily_screen_time_min",
+  "social_media_time_min",
+  "negative_interactions_count",
+  "positive_interactions_count",
+  "sleep_hours",
+  "physical_activity_min",
+  "anxiety_level",
+  "stress_level",
+  "mood_level"
+)
+
+df$mental_bin <- ifelse(df$mental_state == "Healthy", 1L, 0L)
+
+df_sub <- df[, c(num_vars, "mental_bin")]
+df_sub <- na.omit(df_sub)
+
+Y <- df_sub$mental_bin
+X <- scale(df_sub[, num_vars])
+n <- length(Y)
+
+Xc <- cbind(1, as.matrix(X))  # intercept
+p <- ncol(X)
+K <- p + 1
+
+
+
+model_string <- "
+model{
+  for(i in 1:n){
+    Y[i] ~ dbern(pi[i])
+    logit(pi[i]) <- inprod(beta[1:K], Xc[i,1:K])
+  }
+
+  for(j in 1:K){
+    beta[j] ~ dnorm(0, 0.01)
+  }
+}
+"
+
+data_jags <- list(
+  Y = Y,
+  Xc = Xc,
+  n = n,
+  K = K
+)
+
+chains <- 2
+burn   <- 300
+iters  <- 1500
+thin   <- 2
+
+jmodel <- jags.model(
+  textConnection(model_string),
+  data = data_jags,
+  n.chains = chains,
+  n.adapt = 500,
+  quiet = TRUE
+)
+
+update(jmodel, burn)
+
+samps <- coda.samples(
+  jmodel,
+  variable.names = "beta",
+  n.iter = iters,
+  thin = thin
+)
+
+summary(samps)
+plot(samps)
+```
+
+Posterior Distribution Result for dnorm(0, 0.01)
+```{r}
+post_mat <- as.matrix(samps)
+
+post_df <- data.frame(
+  value = as.vector(post_mat),
+  parameter = factor(rep(colnames(post_mat), each = nrow(post_mat)))
+)
+
+ggplot(post_df, aes(x = value)) +
+  geom_density(fill = "gray80") +
+  facet_wrap(~ parameter, scales = "free") +
+  theme_classic()
+```
+
+Accuracy for dnorm(0, 0.01)
+```{r}
+mcmc_mat <- as.matrix(samps)
+
+beta_names <- paste0("beta[", 1:K, "]")
+beta_mean  <- as.numeric(colMeans(mcmc_mat[, beta_names]))
+
+# 95% Credible Interval beta
+beta_ci <- apply(
+  mcmc_mat[, beta_names],
+  2,
+  quantile,
+  probs = c(0.025, 0.975)
+)
+
+beta_hat  <- drop(Xc %*% beta_mean)
+prob_hat <- 1 / (1 + exp(-beta_hat))
+
+pred_class <- ifelse(prob_hat >= 0.5, 1, 0)
+
+pred_class <- factor(pred_class, levels = c(0,1))
+Y_factor   <- factor(Y, levels = c(0,1))
+
+conf_mat <- confusionMatrix(
+  data = pred_class,
+  reference = Y_factor,
+  positive = "1"
+)
+
+prob_post <- apply(
+  mcmc_mat[, beta_names],
+  1,
+  function(b) 1 / (1 + exp(-(Xc %*% b)))
+)
+
+prob_post <- t(prob_post)
+
+prob_ci <- apply(
+  prob_post,
+  1,
+  quantile,
+  probs = c(0.025, 0.975)
+)
+
+print(conf_mat)
+
+cat("\nAccuracy:\n")
+print(conf_mat$overall["Accuracy"])
+
+cat("\nPosterior Mean Beta:\n")
+print(beta_mean)
+
+cat("\n95% Credible Interval Beta:\n")
+print(beta_ci)
+```
+
+Model Evaluation for dnorm(0, 0.01)
+```{r}
+data_jags <- list(
+  Y  = Y,
+  Xc = Xc,
+  n  = n,
+  K  = K
+)
+
+model_string <- "
+model{
+  for(i in 1:n){
+    Y[i] ~ dbern(pi[i])
+    logit(pi[i]) <- inprod(beta[1:K], Xc[i,1:K])
+
+    # Posterior predictive
+    Y_rep[i] ~ dbern(pi[i])
+
+    # Log-likelihood (WAIC & LOO)
+    log_lik[i] <- logdensity.bern(Y[i], pi[i])
+  }
+
+  for(j in 1:K){
+    beta[j] ~ dnorm(0, 0.01)
+  }
+}
+"
+chains <- 2
+burn   <- 300
+iters  <- 1500
+thin   <- 2
+
+jmodel <- jags.model(
+  textConnection(model_string),
+  data = data_jags,
+  n.chains = chains,
+  n.adapt = 500,
+  quiet = TRUE
+)
+
+update(jmodel, burn)
+
+samps <- coda.samples(
+  jmodel,
+  variable.names = c("beta", "Y_rep", "log_lik"),
+  n.iter = iters,
+  thin = thin
+)
+
+#Posterior Predictive Check (PPC)
+Y_rep_mat <- as.matrix(samps[[1]][, grep("Y_rep", colnames(samps[[1]]))])
+
+prop_obs <- mean(Y)
+prop_rep <- rowMeans(Y_rep_mat)
+
+hist(prop_rep,
+     main = "Posterior Predictive Check: Proportion(Y_rep)",
+     xlab = "Proportion Y_rep",
+     col  = "lightgray",
+     border = "white")
+abline(v = prop_obs, col = "red", lwd = 2)
+
+cat("Observed proportion:", prop_obs, "\n")
+
+#DIC
+dic <- dic.samples(jmodel, n.iter = 5000, type = "pD")
+print(dic)
+
+#WAIC & LOO
+loglik_mat <- as.matrix(samps[[1]][, grep("log_lik", colnames(samps[[1]]))])
+
+waic_res <- waic(loglik_mat)
+print(waic_res)
+
+loo_res <- loo(loglik_mat)
+print(loo_res)
+```
+
+Model Estimation Result for dnorm(0, 0.9)
+```{r}
+model_string <- "
+model{
+  for(i in 1:n){
+    Y[i] ~ dbern(pi[i])
+    logit(pi[i]) <- inprod(beta[1:K], Xc[i,1:K])
+  }
+
+  for(j in 1:K){
+    beta[j] ~ dnorm(0, 0.9)
+  }
+}
+"
+
+data_jags <- list(
+  Y = Y,
+  Xc = Xc,
+  n = n,
+  K = K
+)
+
+chains <- 2
+burn   <- 300
+iters  <- 1500
+thin   <- 2
+
+jmodel <- jags.model(
+  textConnection(model_string),
+  data = data_jags,
+  n.chains = chains,
+  n.adapt = 500,
+  quiet = TRUE
+)
+
+update(jmodel, burn)
+
+samps <- coda.samples(
+  jmodel,
+  variable.names = "beta",
+  n.iter = iters,
+  thin = thin
+)
+
+summary(samps)
+plot(samps)
+```
+
+Posterior Predictive Check for dnorm(0, 0.9)
+```{r}
+post_mat <- as.matrix(samps)
+
+post_df <- data.frame(
+  value = as.vector(post_mat),
+  parameter = factor(rep(colnames(post_mat), each = nrow(post_mat)))
+)
+
+ggplot(post_df, aes(x = value)) +
+  geom_density(fill = "gray80") +
+  facet_wrap(~ parameter, scales = "free") +
+  theme_classic()
+```
+
+Accuracy for dnorm(0, 0.9)
+```{r}
+model_string <- "
+model{
+  for(i in 1:n){
+    Y[i] ~ dbern(pi[i])
+    logit(pi[i]) <- inprod(beta[1:K], Xc[i,1:K])
+  }
+
+  for(j in 1:K){
+    beta[j] ~ dnorm(0, 0.9)
+  }
+}
+"
+data_jags <- list(
+  Y = Y,
+  Xc = Xc,
+  n = n,
+  K = K
+)
+
+chains <- 2
+burn   <- 300
+iters  <- 1500
+thin   <- 2
+
+jmodel <- jags.model(
+  textConnection(model_string),
+  data = data_jags,
+  n.chains = chains,
+  n.adapt = 500,
+  quiet = TRUE
+)
+
+update(jmodel, burn)
+
+samps <- coda.samples(
+  jmodel,
+  variable.names = "beta",
+  n.iter = iters,
+  thin = thin
+)
+
+mcmc_mat <- as.matrix(samps)
+
+beta_names <- paste0("beta[", 1:K, "]")
+beta_mean  <- as.numeric(colMeans(mcmc_mat[, beta_names]))
+
+beta_ci <- apply(
+  mcmc_mat[, beta_names],
+  2,
+  quantile,
+  probs = c(0.025, 0.975)
+)
+
+eta_hat  <- drop(Xc %*% beta_mean)
+prob_hat <- 1 / (1 + exp(-eta_hat))
+
+pred_class <- ifelse(prob_hat >= 0.5, 1, 0)
+
+pred_class <- factor(pred_class, levels = c(0,1))
+Y_factor   <- factor(Y, levels = c(0,1))
+
+conf_mat <- confusionMatrix(
+  data = pred_class,
+  reference = Y_factor,
+  positive = "1"
+)
+
+prob_post <- apply(
+  mcmc_mat[, beta_names],
+  1,
+  function(b) 1 / (1 + exp(-(Xc %*% b)))
+)
+
+prob_post <- t(prob_post)
+
+prob_ci <- apply(
+  prob_post,
+  1,
+  quantile,
+  probs = c(0.025, 0.975)
+)
+
+print(conf_mat)
+
+cat("\nAccuracy:\n")
+print(conf_mat$overall["Accuracy"])
+
+cat("\nPosterior Mean Beta:\n")
+print(beta_mean)
+
+cat("\n95% Credible Interval Beta:\n")
+print(beta_ci)
+```
+
+Model Evaluation for dnorm(0, 0.9)
+```{r}
+data_jags <- list(
+  Y  = Y,
+  Xc = Xc,
+  n  = n,
+  K  = K
+)
+
+model_string <- "
+model{
+  for(i in 1:n){
+    Y[i] ~ dbern(pi[i])
+    logit(pi[i]) <- inprod(beta[1:K], Xc[i,1:K])
+
+    # Posterior predictive
+    Y_rep[i] ~ dbern(pi[i])
+
+    # Log-likelihood (WAIC & LOO)
+    log_lik[i] <- logdensity.bern(Y[i], pi[i])
+  }
+
+  for(j in 1:K){
+    beta[j] ~ dnorm(0, 0.9)
+  }
+}
+"
+
+chains <- 2
+burn   <- 300
+iters  <- 1500
+thin   <- 2
+
+jmodel <- jags.model(
+  textConnection(model_string),
+  data = data_jags,
+  n.chains = chains,
+  n.adapt = 500,
+  quiet = TRUE
+)
+
+update(jmodel, burn)
+
+samps <- coda.samples(
+  jmodel,
+  variable.names = c("beta", "Y_rep", "log_lik"),
+  n.iter = iters,
+  thin = thin
+)
+
+#PPC
+Y_rep_mat <- as.matrix(samps[[1]][, grep("Y_rep", colnames(samps[[1]]))])
+
+prop_obs <- mean(Y)
+prop_rep <- rowMeans(Y_rep_mat)
+
+hist(prop_rep,
+     main = "Posterior Predictive Check: Proportion(Y_rep)",
+     xlab = "Proportion Y_rep",
+     col  = "lightgray",
+     border = "white")
+abline(v = prop_obs, col = "red", lwd = 2)
+
+cat("Observed proportion:", prop_obs, "\n")
+
+#DIC
+dic <- dic.samples(jmodel, n.iter = 5000, type = "pD")
+print(dic)
+
+#WAIC&LOO
+loglik_mat <- as.matrix(samps[[1]][, grep("log_lik", colnames(samps[[1]]))])
+
+waic_res <- waic(loglik_mat)
+print(waic_res)
+
+loo_res <- loo(loglik_mat)
+print(loo_res)
+```
+
+Classical Parameter
+```{r}
+library(pROC)
+num_vars <- c(
+  "age",
+  "daily_screen_time_min",
+  "social_media_time_min",
+  "negative_interactions_count",
+  "positive_interactions_count",
+  "sleep_hours",
+  "physical_activity_min",
+  "anxiety_level",
+  "stress_level",
+  "mood_level"
+)
+
+df_sub_z <- df_sub
+df_sub_z[num_vars] <- scale(df_sub[num_vars])
+
+glm_model <- glm(
+  mental_bin ~ age +
+    daily_screen_time_min +
+    social_media_time_min +
+    negative_interactions_count +
+    positive_interactions_count +
+    sleep_hours +
+    physical_activity_min +
+    anxiety_level +
+    stress_level +
+    mood_level,
+  data   = df_sub_z,
+  family = binomial(link = "logit")
+)
+
+summary(glm_model)
+
+# Koefisien (β)
+coef(glm_model)
+
+# Odds Ratio
+exp(coef(glm_model))
+
+# Confidence Interval Odds Ratio
+exp(confint(glm_model))
+
+# Probabilitas
+df_sub_z$prob_hat <- predict(glm_model, type = "response")
+
+# Klasifikasi (threshold 0.5)
+df_sub_z$y_hat <- ifelse(df_sub_z$prob_hat > 0.5, 1, 0)
+
+# Confusion Matrix
+table(
+  Actual    = df_sub_z$mental_bin,
+  Predicted = df_sub_z$y_hat
+)
+
+# Accuracy
+mean(df_sub_z$mental_bin == df_sub_z$y_hat)
+roc_obj <- roc(df_sub_z$mental_bin, df_sub_z$prob_hat)
+auc(roc_obj)
+confusionMatrix(
+  factor(df_sub_z$y_hat),
+  factor(df_sub_z$mental_bin)
+)
+
+```
+
